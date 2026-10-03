@@ -1,7 +1,13 @@
 from __future__ import annotations
 from io import BufferedReader, BufferedWriter
 import struct
+import copy
+import hashlib
 from os import path
+
+
+# afevis fix from bp's original ctxr cooker: correct hasAlpha on every export using PS2's 128-is-opaque range; false disables the fix.
+HAS_ALPHA_USE_128_THRESHOLD = True
 
 
 class CTXR:
@@ -23,6 +29,9 @@ class CTXR:
         return self
     
     def convertDDS(self) -> DDS:
+        if self.header.version != 7 or self.header.format != 0 or self.header.type != 0 or self.header.depth != 1:
+            raise ValueError("DDS extraction currently supports only MC A8R8G8B8 CTXR textures")
+            # user tried to open a ps3/switch ctxr
         dds = DDS()
         dds.header.flags = 0x2100f
         dds.header.width = self.header.width
@@ -42,19 +51,24 @@ class CTXR:
         for chunk in self.chunks:
             chunk.writeToFile(file)
 
+#header ported from https://github.com/316austin316/CTXR-Converter/blob/main/ctxr_utils.py
 class CTXRHeader:
     magic: bytes  # "TXTR"
     version: int  # 7
     width: int
     height: int
     depth: int
-    unknown1: int
-    unknown2: int
-    unknown3: int  # 0x100
-    unknown4: list[int]  # 18 bytes
+    format: int
+    hasAlpha: int
+    additionalFlags: int
+    minRGBA: int
+    maxRGBA: int
+    filterHint: int
+    alphaRefValue: int
+    maxLODOffset: int
+    type: int
     numMipmaps: int
-    padByte: int
-    padding: list[int]  # 22 int32s
+    padding: bytes
     
     def __init__(self):
         self.magic = b"TXTR"
@@ -62,34 +76,38 @@ class CTXRHeader:
         self.width = 0
         self.height = 0
         self.depth = 1
-        self.unknown1 = 0
-        self.unknown2 = 0
-        self.unknown3 = 0x100
-        self.unknown4 = [0] * 18
+        self.format = 0
+        self.hasAlpha = 0
+        self.additionalFlags = 0
+        self.minRGBA = 0
+        self.maxRGBA = 0
+        self.filterHint = -1
+        self.alphaRefValue = 0xff
+        self.maxLODOffset = 0
+        self.type = 0
         self.numMipmaps = 1
-        self.padByte = 0
-        self.padding = [0] * 22
+        self.padding = bytes(89)
     
     def fromFile(self, file: BufferedReader):
-        self.magic, self.version, self.width, self.height, \
-        self.depth, self.unknown1, self.unknown2, self.unknown3 \
-        = struct.unpack(">4sIHHHHHH", file.read(0x14))
-        
-        self.unknown4 = list(struct.unpack("18B", file.read(18)))
-        self.numMipmaps, self.padByte = struct.unpack("2B", file.read(2))
-        self.padding = list(struct.unpack(">22I", file.read(0x58)))
+        # filter and lod hints are signed bytes.
+        self.magic, self.version, self.width, self.height, self.depth, \
+        self.format, self.hasAlpha, self.additionalFlags, self.minRGBA, self.maxRGBA, \
+        self.filterHint, self.alphaRefValue, self.maxLODOffset, self.type, self.numMipmaps \
+        = struct.unpack(">4sIHHHIBIIIbBbIB", file.read(0x27))
+        if self.magic != b'TXTR' or self.version != 7:
+            raise ValueError("Expected a v7 TXTR header")
+        self.padding = file.read(89)
+        if len(self.padding) != 89:
+            raise ValueError("Truncated CTXR header")
         
         return self
     
     def writeToFile(self, file: BufferedWriter):
-        file.write(self.magic)
-        file.write(struct.pack(">IHHHHHH", self.version, self.width, self.height, \
-        self.depth, self.unknown1, self.unknown2, self.unknown3))
-        for unk in self.unknown4:
-            file.write(struct.pack("B", unk))
-        file.write(struct.pack("BB", self.numMipmaps, self.padByte))
-        for pad in self.padding:
-            file.write(struct.pack(">I", pad))
+        file.write(struct.pack(">4sIHHHIBIIIbBbIB", self.magic, self.version, \
+        self.width, self.height, self.depth, self.format, self.hasAlpha, \
+        self.additionalFlags, self.minRGBA, self.maxRGBA, self.filterHint, \
+        self.alphaRefValue, self.maxLODOffset, self.type, self.numMipmaps))
+        file.write(self.padding)
 
 class CTXRChunk:
     size: int
@@ -129,25 +147,53 @@ class DDS:
         
         return self
     
-    def convertCTXR(self) -> CTXR:
+    def contentDigest(self):
+        dimensions = struct.pack('<III', self.header.width, self.header.height, self.header.numMipmaps)
+        return hashlib.sha256(dimensions + self.data).hexdigest()
+
+    def convertCTXR(self, source_header=None, source_digest=None) -> CTXR:
+        if self.header.pixelFormat.fourcc or self.header.pixelFormat.bitCount != 32 or self.header.pixelFormat.bitMasks != [0xff0000, 0xff00, 0xff, 0xff000000]:
+            raise ValueError("CTXR packing requires uncompressed 32-bit BGRA DDS")
+        if self.header.depth > 1 or self.header.caps[1]:
+            raise ValueError("CTXR packing requires a 2D DDS, not a volume or cubemap")
+        if self.header.width < 1 or self.header.height < 1 or self.header.numMipmaps < 1:
+            raise ValueError("DDS dimensions and mip count must be positive")
         ctxr = CTXR()
+        if source_header is not None:
+            if source_header.format != 0 or source_header.type != 0 or source_header.depth != 1:
+                raise ValueError("Cannot replace a non-BGRA, volume or cubemap CTXR with a 2D DDS")
+            ctxr.header = copy.deepcopy(source_header)
         ctxr.header.width = self.header.width
         ctxr.header.height = self.header.height
+        # afevis fix from vanilla ctxr cooker: use the DDS mip count; the vanilla cooker's ceil(log2(size)) overcounts NPOT chains.
         ctxr.header.numMipmaps = self.header.numMipmaps
-        ctxr.header.unknown4 = [0, 0, 0] + [0xff] * 10 + [0, 0, 0, 0, 0]
         ctxr.chunks = []
         
         dataPos = 0
-        dataSize = self.header.width * self.header.height * 4
+        width, height = self.header.width, self.header.height
         for i in range(self.header.numMipmaps):
-            # print(f"Generating mipmap {i} for CTXR, size {dataSize}...")
+            dataSize = width * height * 4
+            if dataPos + dataSize > len(self.data):
+                raise ValueError("DDS mip data is truncated or isn't uncompressed 32-bit RGBA")
             newChunk = CTXRChunk()
             newChunk.size = dataSize
             newChunk.data = self.data[dataPos:dataPos+dataSize]
             ctxr.chunks.append(newChunk)
             dataPos += dataSize
-            dataSize //= 4
+            # afevis fix from vanilla ctxr cooker: keep the short side of rectangular mips from shrinking to zero.
+            width, height = max(1, width // 2), max(1, height // 2)
         
+        if dataPos != len(self.data):
+            raise ValueError("DDS contains unexpected data beyond its declared mip levels")
+        if source_header is None or source_digest != self.contentDigest():
+            # calculate color bounds across every mip.
+            channels = [self.data[i::4] for i in (2, 1, 0, 3)]
+            ctxr.header.minRGBA = int.from_bytes(bytes(min(c) for c in channels), 'big')
+            ctxr.header.maxRGBA = int.from_bytes(bytes(max(c) for c in channels), 'big')
+            threshold = 128 if HAS_ALPHA_USE_128_THRESHOLD else 255
+            ctxr.header.hasAlpha = int(min(channels[3]) < threshold)
+        if HAS_ALPHA_USE_128_THRESHOLD:
+            ctxr.header.hasAlpha = int(min(self.data[3::4]) < 128)
         return ctxr
     
     def writeToFile(self, file: BufferedWriter):

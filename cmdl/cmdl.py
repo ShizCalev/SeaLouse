@@ -5,6 +5,26 @@ import struct
 from ..kms.kms import KMSVector3
 
 
+def float32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def sourceNormal(x, y, z, renormalize=True):
+    x, y, z = (float32(0.0 if isnan(c) else c) for c in (x, y, z))
+    if renormalize:
+        total = float32(float32(float32(x * x) + float32(y * y)) + float32(z * z))
+        length = float32(total**0.5)
+        if length:
+            x, y, z = (float32(c / length) for c in (x, y, z))
+    return x, y, z
+
+
+def packedNormalComponents(x, y, z, renormalize=True):
+    normal = sourceNormal(x, y, z, renormalize)
+    # int() matches c++ uint32 cast, truncating instead of rounding.
+    return tuple(int(float32(c * scale)) for c, scale in zip(normal, (1023, 1023, 511)))
+
+
 class CMDL:
     header: CMDLHeader
     sections: List[CMDLSection]
@@ -34,11 +54,11 @@ class CMDL:
         curSectionOffset = 0x10 + 0x20 * len(self.sections)
         file.seek(curSectionOffset)
         file.write(struct.pack("<3i", -1, -1, -1))
-        for section in self.sections:
+        for section_index, section in enumerate(self.sections):
             section.dataSize = section.data.size * len(section.data.data)
             section.dataOffset = curSectionOffset
             curSectionOffset += section.dataSize
-            if curSectionOffset % 0x10 > 0:
+            if section_index + 1 < len(self.sections) and curSectionOffset % 0x10 > 0:
                 file.seek(curSectionOffset + 0xC)
                 while ((file.tell() % 0x10) & 0xC) != 0xC:
                     file.write(struct.pack("<i", -1))
@@ -88,8 +108,8 @@ class CMDLHeader:
 
 class CMDLSection:
     magic: bytes
-    unknown_04: int # No! That is NOT zero!
-    unknown_06: int
+    storageType: int  # vertex attribute storage type
+    flags: int  # 2: dataOffset is relative to the vertex array
     dataOffset: int
     dataSize: int
     data: CMDLSectionData
@@ -99,28 +119,29 @@ class CMDLSection:
             self.magic = bytes(magic, "utf-8")
         else:
             self.magic = bytes(magic)
-        self.unknown_04 = 0
-        self.unknown_06 = 2
+        self.storageType = 0
+        self.flags = 2
         self.dataOffset = 0
         self.dataSize = 0
         if self.magic == b"POS0":
             self.data = CMDLPosData()
-            self.unknown_04 = 2
+            self.storageType = 2
         elif self.magic == b"BONI":
             self.data = CMDLBonIData()
-            self.unknown_04 = 4
+            self.storageType = 4
         elif self.magic[:3] == b"TEX":
             self.data = CMDLTexData()
-            self.unknown_04 = 5
+            self.storageType = 6 if self.magic == b"TEX2" else 5
+            self.data.size = 8 if self.magic == b"TEX2" else 4
         elif self.magic == b"BONW":
             self.data = CMDLBonWData()
-            self.unknown_04 = 6
+            self.storageType = 6
         elif self.magic == b"NRM0":
             self.data = CMDLNrmData()
-            self.unknown_04 = 9
+            self.storageType = 9
         elif self.magic == b"OIDX":
             self.data = CMDLOIdxData()
-            self.unknown_04 = 0xA
+            self.storageType = 0xA
         else:
             self.data = None
     
@@ -128,7 +149,7 @@ class CMDLSection:
         self.magic = bytes(reversed(file.read(4)))
         if not (self.magic in { b"POS0", b"NRM0", b"OIDX", b"BONI", b"BONW" } or self.magic[:3] == b"TEX"):
             raise Exception(f"Unexpected section magic {self.magic}")
-        self.unknown_04, self.unknown_06, self.dataOffset, pad \
+        self.storageType, self.flags, self.dataOffset, pad \
         = struct.unpack("<HHII", file.read(0xC))
         assert(pad == 0) # Expected zero
         self.dataSize, pad1, pad2, pad3 = struct.unpack("<IIII", file.read(0x10))
@@ -146,6 +167,8 @@ class CMDLSection:
             self.data = CMDLBonWData()
         elif self.magic[:3] == b"TEX":
             self.data = CMDLTexData()
+            if self.storageType == 6:
+                self.data.size = 8
         else:
             assert(False) # How did we get here?
         
@@ -158,7 +181,7 @@ class CMDLSection:
     
     def writeToFile(self, file: BufferedWriter):
         file.write(bytes(reversed(self.magic)))
-        file.write(struct.pack("<HHIIIIII", self.unknown_04, self.unknown_06, self.dataOffset, 0, \
+        file.write(struct.pack("<HHIIIIII", self.storageType, self.flags, self.dataOffset, 0, \
         self.dataSize, 0, 0, 0))
         
         curPos = file.tell()
@@ -187,7 +210,6 @@ class CMDLPosData(CMDLSectionData): # Coordinates
     def fromFile(self, file: BufferedReader, fullSize: int):
         vertCount = fullSize // self.size
         self.data = [struct.unpack("<ffff", file.read(0x10)) for _ in range(vertCount)]
-        assert(all(x[3] == 1.0 for x in self.data)) # Unexpected "w" (v4) value in vertex position
         
         return self
     
@@ -200,6 +222,7 @@ class CMDLNrmData(CMDLSectionData): # Normals
     
     def __init__(self):
         self.data = []
+        self.renormalize = True
     
     def fromFile(self, file: BufferedReader, fullSize: int):
         vertCount = fullSize // self.size
@@ -222,7 +245,7 @@ class CMDLNrmData(CMDLSectionData): # Normals
             if normalZ & (1 << 9):
                 normalZ &= ~(1 << 9)
                 normalZ -= 1 << 9
-            # normalize
+            # keep the decoded normal's original length.
             normalX /= (1<<10)-1
             normalY /= (1<<10)-1
             normalZ /= (1<<9)-1
@@ -233,30 +256,8 @@ class CMDLNrmData(CMDLSectionData): # Normals
     
     def writeToFile(self, file: BufferedWriter):
         for vert in self.data:
-            # Normalize normals because sometimes Blender gets extra silly
-            vert = list(vert)
-            if isnan(vert[0]): vert[0] = 0
-            if isnan(vert[1]): vert[1] = 0
-            if isnan(vert[2]): vert[2] = 0
-            vert_total = (vert[0]**2 + vert[1]**2 + vert[2]**2)**0.5
-            if vert_total == 0.0:
-                vert_total = 1.0
-                vert[0] = 1.0
-            vert[0] /= vert_total; vert[1] /= vert_total; vert[2] /= vert_total
-            # I know where this code came from, it was ChatGPT when told to reverse that other code
-            nx = int(round(vert[0] * float((1<<10)-1)))
-            ny = int(round(vert[1] * float((1<<10)-1)))
-            nz = int(round(vert[2] * float((1<<9 )-1)))
-            if nx < 0:
-                nx += (1 << 10)
-                nx |= 1 << 10
-            if ny < 0:
-                ny += (1 << 10)
-                ny |= 1 << 10
-            if nz < 0:
-                nz += (1 << 9)
-                nz |= 1 << 9
-            normal = nx | (ny << 11) | (nz << 22)
+            nx, ny, nz = packedNormalComponents(*vert, self.renormalize)
+            normal = (nx & 2047) | ((ny & 2047) << 11) | ((nz & 1023) << 22)
             file.write(struct.pack("<I", normal))
 
 class CMDLTexData(CMDLSectionData): # UV maps
@@ -268,15 +269,15 @@ class CMDLTexData(CMDLSectionData): # UV maps
     def fromFile(self, file: BufferedReader, fullSize: int):
         vertCount = fullSize // self.size
         # Everybody loves the half-precision float format (5 bit exponent, 10 bit mantissa)
-        self.data = [struct.unpack("<ee", file.read(4)) for _ in range(vertCount)]
+        self.data = [struct.unpack("<" + "e" * (self.size // 2), file.read(self.size)) for _ in range(vertCount)]
         
         return self
     
     def writeToFile(self, file: BufferedWriter):
         for vert in self.data:
-            file.write(struct.pack("<ee", vert[0], vert[1]))
+            file.write(struct.pack("<" + "e" * (self.size // 2), *vert))
 
-class CMDLOIdxData(CMDLSectionData): # Point back to KMS indices
+class CMDLOIdxData(CMDLSectionData):  # indices into the flattened KMS/EVM vertex stream
     size = 4
     
     def __init__(self):

@@ -1,8 +1,12 @@
 import bpy
 import os
+import glob
+from io import BytesIO
 from math import radians
-from ..ctxr.ctxr import DDS, CTXR, ctxr_lookup_path
-from .util import replaceExt, stripAllExt, create_bak
+from ..ctxr.ctxr import DDS, CTXR, CTXRHeader, ctxr_lookup_path
+from .atomic_output import atomic_output
+from ..tri.tri import TRI, transcache_lookup_path
+from .util import replaceExt, stripAllExt, create_bak, gv_strcode
 
 class MaterialHelper:
     material: bpy.types.Material
@@ -37,7 +41,7 @@ class MaterialHelper:
         env_multiplier = self.nodes.new(type='ShaderNodeMix')
         env_multiplier.name = 'Multiply EnvMap'
         env_multiplier.label = 'Multiply EnvMap'
-        specular_node = specular_output.node  # Give this some space on the x-axis
+        specular_node = specular_output.node
         env_multiplier.location = (specular_node.location[0] + 300, env_node.location[1])
         env_multiplier.hide = True
         
@@ -48,51 +52,79 @@ class MaterialHelper:
         self.links.new(env_node.outputs['Color'], env_multiplier.inputs[7])  # 'B'
         return env_multiplier
     
-    @staticmethod
-    def get_unique_id(flag: int, colorId: int, specularId: int, environmentId: int) -> str:
-        return str(flag)+str(colorId)+str(specularId)+str(specularId)
 
 
 class TextureLoad:
     extract_dir: str
     ctxr_dir: str | None  # ctxr load folder if using ctxr
+    tri_dir: str | None  # folder to search for fallback transcache*.tri files, if using tri
     ctxr_name_lookup: dict
-    material_cache: dict
+    transcache_lookup: dict
     overwrite_existing: bool
 
-    def __init__(self, extract_dir: str, ctxr_dir: str = None, overwrite_existing: bool = False):
+    def __init__(self, extract_dir: str, ctxr_dir: str = None, overwrite_existing: bool = False, tri_dir: str = None, tri_code: int = 0):
         self.extract_dir = extract_dir
         self.ctxr_dir = ctxr_dir
-        self.material_cache = {}
+        self.tri_dir = tri_dir
+        self.tri_code = tri_code
+        self.tri_fallback_cache = {}
         self.ctxr_name_lookup = {}
+        self.transcache_lookup = {}
         self.overwrite_existing = overwrite_existing
 
-        # Load dictionary regardless, we'll use it to guess texture blending modes
+        # keep readable material names even when loading textures from TRI.
         with open(ctxr_lookup_path, "rt") as f:
             for line in f.readlines():
                 tga_num = os.path.splitext(line.split()[1])[0]
                 self.ctxr_name_lookup[int(tga_num)] = line.split()[2]
     
+        with open(transcache_lookup_path, "rt") as f:
+            for line in f.readlines():
+                parts = line.split()
+                self.transcache_lookup[int(parts[1])] = parts[2]
+
     def get_texture(self, mapID: int) -> bpy.types.Image | None:
+        from ..tri.texture_sources import texture_name, texture_override, load_texture
+
+        if not mapID:
+            return None
+        if self.ctxr_dir and texture_override(self.tri_code, mapID):
+            if mapID not in self.tri_fallback_cache:
+                self.tri_fallback_cache[mapID] = load_texture(mapID, self.extract_dir, self.tri_dir, self.tri_code)
+            return self.tri_fallback_cache[mapID]
         mapName = self.get_texture_nice_name(mapID) if self.ctxr_dir else self.get_texture_tri_name(mapID)
+        mapped_name = texture_name(self.tri_code, mapID) if self.ctxr_dir else None
+        if mapped_name:
+            mapName = mapped_name + '.dds'
         if mapName == "":
             return None
-        if mapName.endswith(".png"):
+        if self.ctxr_dir and mapName.endswith(".png"):
             mapName = replaceExt(mapName, "dds")
         
-        if bpy.data.images.get(mapName) is not None:
-            return bpy.data.images.get(mapName)
-        
         mapPath = os.path.join(self.extract_dir, mapName)
+        source = os.path.abspath(os.path.join(self.ctxr_dir, replaceExt(mapName, 'ctxr'))) if self.ctxr_dir else None
+        if not self.overwrite_existing:
+            for image in bpy.data.images:
+                if image.filepath and os.path.abspath(image.filepath_from_user()) == os.path.abspath(mapPath):
+                    if not self.ctxr_dir or (image.get('sealouse_ctxr_source') == source and image.get('sealouse_texture_id') == mapID):
+                        return self.remember_ctxr_header(image, mapName, mapID)
         
         if not os.path.exists(mapPath) or self.overwrite_existing:
             if not self.ctxr_dir:
+                # kcej often used a stage's transcache.tri as a hotfix archive instead of reauthoring the original tri/model files.
+                # if we can't find a specific texture in the model's specified tri, check the transcache.
+                if self._tryLoadFromTranscache(mapID, mapPath):
+                    return bpy.data.images.get(mapName)
                 print("Path did not exist:", mapPath)
                 return None
             # Load ctxr
             ctxr_path = os.path.join(self.ctxr_dir, replaceExt(mapName, "ctxr"))
             if not os.path.exists(ctxr_path):
-                return None
+                from ..tri.texture_sources import load_texture
+
+                if mapID not in self.tri_fallback_cache:
+                    self.tri_fallback_cache[mapID] = load_texture(mapID, self.extract_dir, self.tri_dir, self.tri_code)
+                return self.tri_fallback_cache[mapID]
             print("Extracting", ctxr_path, "to DDS")
             ctxr = CTXR()
             with open(ctxr_path, "rb") as f:
@@ -101,8 +133,53 @@ class TextureLoad:
             with open(mapPath, "wb") as f:
                 dds.writeToFile(f)
         
-        bpy.data.images.load(mapPath)
-        return bpy.data.images.get(mapName)
+        image = bpy.data.images.load(mapPath)
+        return self.remember_ctxr_header(image, mapName, mapID)
+
+    def remember_ctxr_header(self, image, mapName, mapID):
+        if image is not None and self.ctxr_dir:
+            source = os.path.join(self.ctxr_dir, replaceExt(mapName, 'ctxr'))
+            image['sealouse_ctxr_source'] = os.path.abspath(source)
+            image['sealouse_ctxr_name'] = replaceExt(mapName, 'ctxr')
+            image['sealouse_texture_id'] = mapID
+            if os.path.isfile(source):
+                with open(source, 'rb') as stream:
+                    ctxr = CTXR().fromFile(stream)
+                header = BytesIO()
+                ctxr.header.writeToFile(header)
+                image['sealouse_ctxr_header'] = header.getvalue().hex()
+                image['sealouse_ctxr_digest'] = ctxr.convertDDS().contentDigest()
+        return image
+    
+    def _tryLoadFromTranscache(self, mapID: int, mapPath: str) -> bool:
+        # MC: bluepoint shit out a bunch of transcache files with different names. use transcachemapping.txt rather than scanning all of them at runtime.
+        if self.tri_dir and mapID in self.transcache_lookup:
+            transcache_path = os.path.join(self.tri_dir, self.transcache_lookup[mapID])
+            if os.path.exists(transcache_path):
+                print("Texture not in model's own tri, trying", self.transcache_lookup[mapID])
+                tri = TRI()
+                with open(transcache_path, "rb") as f:
+                    tri.fromFile(f)
+                if tri.dumpById(self.extract_dir, mapID) is not None:
+                    bpy.data.images.load(mapPath)
+                    return True
+
+        # PS2 dumps: transcache is right next to the model, https://www.youtube.com/watch?v=m2qUfEryiNk
+        modelDir = os.path.dirname(self.extract_dir)
+        candidatePaths = set(glob.glob(os.path.join(modelDir, "transcache*.tri")))
+        hashedPath = os.path.join(modelDir, f"{gv_strcode('transcache'):06x}.tri")
+        if os.path.exists(hashedPath):
+            candidatePaths.add(hashedPath)
+        for transcache_path in sorted(candidatePaths):
+            print("Texture not in model's own tri, trying", os.path.basename(transcache_path))
+            tri = TRI()
+            with open(transcache_path, "rb") as f:
+                tri.fromFile(f)
+            if tri.dumpById(self.extract_dir, mapID) is not None:
+                bpy.data.images.load(mapPath)
+                return True
+
+        return False
     
     def get_texture_nice_name(self, mapID: int) -> str:
         mapName = self.get_texture_tri_name(mapID)
@@ -114,22 +191,15 @@ class TextureLoad:
     def get_texture_tri_name(mapID: int) -> str:
         if mapID == 0:
             return ""
-        return f"{mapID}.tga"
+        return f"{mapID:06x}.png"
 
 
-    def makeMaterial(self, name: str, flag: int, colorId: int, specularId: int, environmentId: int, merge_materials: bool) -> bpy.types.Material:
-        unique_id = MaterialHelper.get_unique_id(flag, colorId, specularId, environmentId)
-
-        if merge_materials and unique_id in self.material_cache:
-            return self.material_cache[unique_id]
-
+    def makeMaterial(self, name: str, flag: int, colorId: int, specularId: int, environmentId: int) -> bpy.types.Material:
         colorMapName = self.get_texture_nice_name(colorId)
         material = bpy.data.materials.new(stripAllExt(colorMapName))
-        self.material_cache[unique_id] = material
         matHelper = MaterialHelper(material)
         # Save flag as custom property
         material["flag"] = flag
-        # Recreate Nodes and Links with references
         nodes = matHelper.nodes
         links = matHelper.links
         # Render properties (TODO: User-defined? See blend method below also)
@@ -150,7 +220,13 @@ class TextureLoad:
         output_link = links.new( principled.outputs['BSDF'], output.inputs['Surface'] )
 
         colorMap = self.get_texture(colorId)
-        isAlphaBlended = colorMap is not None and colorMapName.find("alp") >= 0 # and colorMapName.find("ovl") >= 0
+        isAlphaBlended = False
+        if colorMap is not None:
+            if 'sealouse_ctxr_header' in colorMap:
+                header = CTXRHeader().fromFile(BytesIO(bytes.fromhex(colorMap['sealouse_ctxr_header'])))
+                isAlphaBlended = bool(header.hasAlpha) and (header.minRGBA & 0xff) < 128
+            else:
+                isAlphaBlended = any(a < 128 / 255 for a in colorMap.pixels[3::4])
         if colorMap is not None:
             color_image = nodes.new(type='ShaderNodeTexImage')
             color_image.location = 0,0
@@ -169,9 +245,7 @@ class TextureLoad:
                 material.blend_method = 'BLEND'
                 material.use_backface_culling = False
                 material.show_transparent_back = True
-                output_alpha = color_image.outputs['Alpha']
-                if self.ctxr_dir:
-                    output_alpha = matHelper.make_alpha_multiplier(color_image).outputs[0]
+                output_alpha = matHelper.make_alpha_multiplier(color_image).outputs[0]
                 links.new(output_alpha, principled.inputs['Alpha'])
                 
         elif colorId > 0:
@@ -187,11 +261,8 @@ class TextureLoad:
             specular_image.hide = True
             specular_image.name = "g_SpecularMap"
             specular_image.label = "g_SpecularMap"
-            specularOut = specular_image.outputs['Alpha']
-
-            if self.ctxr_dir:
-                specular_mul_node = matHelper.make_alpha_multiplier(specular_image, "Specular Alpha Multiplier")
-                specularOut = specular_mul_node.outputs[0]
+            specular_mul_node = matHelper.make_alpha_multiplier(specular_image, "Specular Alpha Multiplier")
+            specularOut = specular_mul_node.outputs[0]
                 
             if 'Specular' in principled.inputs:
                 links.new(specularOut, principled.inputs['Specular'])
@@ -223,9 +294,6 @@ class TextureLoad:
             env_image = nodes.new(type='ShaderNodeTexEnvironment')
             env_image.location = 0,-120
             env_image.image = envMap
-            # Environment maps are supposed to contain colors
-            # if envMap != colorMap:
-            #     envMap.colorspace_settings.name = 'Non-Color'
             env_image.hide = True
             env_image.name = "g_EnvironmentMap"
             env_image.label = "g_EnvironmentMap"
@@ -234,12 +302,12 @@ class TextureLoad:
             links.new(env_uv.outputs['Reflection'], env_mapping.inputs['Vector'])
             links.new(env_mapping.outputs['Vector'], env_image.inputs['Vector'])
 
-            # Truer to the PS2 look, environment maps are rendered as an additive pass
             
             if specularMap is not None:
                 env_mul = matHelper.make_specular_env_multiplier(env_image, specularOut)
                 environmentOut = env_mul.outputs[2]  # Color Result
             
+            # approximate the game's additive environment pass using emission.
             if 'Emission Color' in principled.inputs:
                 links.new(environmentOut, principled.inputs['Emission Color'])
             else:
@@ -248,10 +316,6 @@ class TextureLoad:
             
             principled.inputs['Emission Strength'].default_value = 1.0
             
-            # output_alpha = env_image.outputs['Alpha']
-            # if self.ctxr_dir:
-            #     output_alpha = matHelper.make_alpha_multiplier(env_image).outputs[0]
-            # links.new(output_alpha, principled.inputs['Metallic'])
         elif environmentId > 0:
             material["environmentMapFallback"] = environmentId
         
@@ -274,8 +338,9 @@ class TextureSave:
         mapID = 0
         matchImage = None
         
-        if nodes.get(f"g_{mapType.capitalize()}") is not None:
-            matchImage = nodes[f"g_{mapType.capitalize()}"].image
+        nodeName = "g_" + mapType[0].upper() + mapType[1:]
+        if nodes.get(nodeName) is not None:
+            matchImage = nodes[nodeName].image
         elif mat.get(f"{mapType}Fallback") is not None:
             mapID = mat[f"{mapType}Fallback"]
         if not matchImage and "Principled BSDF" in nodes:  # Check anything
@@ -298,25 +363,39 @@ class TextureSave:
             if len(principled.inputs[inputName].links) != 1:
                 return mapID
             fromNode = principled.inputs[inputName].links[0].from_node
-            if fromNode.bl_idname == 'ShaderNodeTexImage':
+            if fromNode.bl_idname in {'ShaderNodeTexImage', 'ShaderNodeTexEnvironment'}:
                 matchImage = fromNode.image
-            elif fromNode.bl_idname == 'ShaderNodeMath' and len(fromNode.inputs[0].links) == 1:
+            elif (
+                fromNode.bl_idname == 'ShaderNodeMath' and len(fromNode.inputs[0].links) == 1
+                and fromNode.inputs[0].links[0].from_node.bl_idname
+                in {'ShaderNodeTexImage', 'ShaderNodeTexEnvironment'}
+            ):
                 matchImage = fromNode.inputs[0].links[0].from_node.image
-            elif fromNode.bl_idname == 'ShaderNodeMix' and len(fromNode.inputs[7].links) == 1 and \
-              fromNode.inputs[7].links[0].from_node.bl_idname == 'ShaderNodeTexImage':
+            elif (
+                fromNode.bl_idname == 'ShaderNodeMix' and len(fromNode.inputs[7].links) == 1 and \
+              fromNode.inputs[7].links[0].from_node.bl_idname
+                in {'ShaderNodeTexImage', 'ShaderNodeTexEnvironment'}
+            ):
                 matchImage = fromNode.inputs[7].links[0].from_node.image
-                # Also consider swapping A and B inputs (very unlikely, but not hard to cover our bases)
-            elif fromNode.bl_idname == 'ShaderNodeMix' and len(fromNode.inputs[6].links) == 1 and \
-              fromNode.inputs[6].links[0].from_node.bl_idname == 'ShaderNodeTexImage':
+            # also accept the texture on the mix node's other input.
+            elif (
+                fromNode.bl_idname == 'ShaderNodeMix' and len(fromNode.inputs[6].links) == 1 and \
+              fromNode.inputs[6].links[0].from_node.bl_idname
+                in {'ShaderNodeTexImage', 'ShaderNodeTexEnvironment'}
+            ):
                 matchImage = fromNode.inputs[6].links[0].from_node.image
             else:
                 return mapID
         
         if matchImage is not None:
+            if 'sealouse_texture_id' in matchImage:
+                if 'sealouse_ctxr_name' in matchImage:
+                    self.textures_to_save.add(matchImage)
+                return int(matchImage['sealouse_texture_id'])
             matchImageName, matchImageExt = os.path.splitext(matchImage.name)
-            # TGA detection takes priority over fallback ID
-            if matchImageName.isnumeric() and matchImageExt == ".tga":
-                mapID = int(matchImageName)
+            # TRI-sourced PNG detection takes priority over fallback ID
+            if matchImageExt == ".png" and matchImageName != "" and all(c in "0123456789abcdefABCDEF" for c in matchImageName):
+                mapID = int(matchImageName, 16)
             elif matchImageExt == ".dds":
                 self.textures_to_save.add(matchImage)
                 # DDS detection does not have priority over fallback ID
@@ -327,20 +406,27 @@ class TextureSave:
     
     def save_textures(self, extract_dir: str, bak_mode: str = 'never'):
         for image in self.textures_to_save:
-            ctxr_name = replaceExt(image.name, "ctxr")
+            ctxr_name = image.get('sealouse_ctxr_name', replaceExt(image.name, "ctxr"))
             print("Packing image", ctxr_name)
             if not os.path.exists(image.filepath_from_user()):
                 print("Error: Could not locate image on disk, skipping.")
                 continue
             with open(image.filepath_from_user(), "rb") as f:
                 dds = DDS().fromFile(f)
-            ctxr = dds.convertCTXR()
-            if "ovl" in ctxr_name and "alp" in ctxr_name:
-                # Specular maps/transparent textures need different parameters
-                ctxr.header.unknown4 = [0, 0, 0, 2, 2, 2, 0, 2, 2, 2, 0x68, 0xff, 0xff, 0, 0, 0, 0, 0]
             ctxr_path = os.path.join(extract_dir, ctxr_name)
+            source_header = None
+            source_digest = None
+            if 'sealouse_ctxr_header' in image:
+                source_header = CTXRHeader().fromFile(BytesIO(bytes.fromhex(image['sealouse_ctxr_header'])))
+                source_digest = image.get('sealouse_ctxr_digest')
+            elif os.path.isfile(ctxr_path):
+                with open(ctxr_path, 'rb') as stream:
+                    original = CTXR().fromFile(stream)
+                source_header = original.header
+                source_digest = original.convertDDS().contentDigest()
+            ctxr = dds.convertCTXR(source_header, source_digest)
             create_bak(ctxr_path, bak_mode)
-            with open(ctxr_path, "wb") as f:
+            with atomic_output(ctxr_path) as f:
                 ctxr.writeToFile(f)
 
 # Thanks TrikzMe

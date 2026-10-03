@@ -29,10 +29,12 @@ bl_info = {
         }
 
 import bpy
+from .tri.texture_sources import TextureChoice
 from .kms.importer.kmsImportOperator import ImportMgsKms
 from .kms.exporter.kmsExportOperator import ExportMgsKms
 from .evm.importer.evmImportOperator import ImportMgsEvm
 from .evm.exporter.evmExportOperator import ExportMgsEvm
+from .zms.operators import ImportMgsZms, ExportMgsZms
 from .tri.importer.triImportOperator import ImportMgsTri
 from .tri.exporter.triExportOperator import ExportMgsTri
 from .ctxr.importer.ctxrImportOperator import ImportMgsCtxr
@@ -49,6 +51,7 @@ class IMPORT_SL_MainMenu(bpy.types.Menu):
     def draw(self, context):
         self.layout.operator(ImportMgsKms.bl_idname, text="KMS File for MGS2 (.kms)")
         self.layout.operator(ImportMgsEvm.bl_idname, text="EVM File for MGS2 (.evm)")
+        self.layout.operator(ImportMgsZms.bl_idname, text="ZMS Archive for MGS2 (.zms)")
         self.layout.operator(ImportMgsTri.bl_idname, text="Dump TRI textures for MGS2 (.tri)")
         self.layout.operator(ImportMgsCtxr.bl_idname, text="Dump CTXR textures for MGS2 (.ctxr)")
 
@@ -59,6 +62,7 @@ class EXPORT_SL_MainMenu(bpy.types.Menu):
     def draw(self, context):
         self.layout.operator(ExportMgsKms.bl_idname, text="KMS File for MGS2 (.kms)")
         self.layout.operator(ExportMgsEvm.bl_idname, text="EVM File for MGS2 (.evm)")
+        self.layout.operator(ExportMgsZms.bl_idname, text="ZMS Archive for MGS2 (.zms)")
         self.layout.operator(ExportMgsTri.bl_idname, text="Edit TRI Files for MGS2 (.tri)")
 
 
@@ -69,6 +73,8 @@ classes = {
     ExportMgsTri,
     ImportMgsEvm,
     ExportMgsEvm,
+    ImportMgsZms,
+    ExportMgsZms,
     ImportMgsCtxr,
     IMPORT_SL_MainMenu,
     EXPORT_SL_MainMenu
@@ -90,6 +96,7 @@ def register():
     # properties.register()
     # ui.register()
     
+    bpy.utils.register_class(TextureChoice)
     for cls in classes:
         bpy.utils.register_class(cls)
     
@@ -105,6 +112,7 @@ def unregister():
     
     for cls in classes:
         bpy.utils.unregister_class(cls)
+    bpy.utils.unregister_class(TextureChoice)
     
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)

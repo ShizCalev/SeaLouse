@@ -16,10 +16,17 @@ def main(tri_path: str, col: bpy.types.Collection, stage_path: str = None, stage
     else:
         tri = TRI()
     
-    # Iterate materials in scene, save them
+    # update texture references only; pixel packing isn't implemented.
     texIDs = [x.texID for x in tri.textures]
     texSave = TextureSave()
-    for mat in bpy.data.materials:  # TODO: Should iterate only collection objects
+    colMaterials = []
+    for obj in col.all_objects:
+        if obj.type != "MESH":
+            continue
+        for slot in obj.material_slots:
+            if slot.material and slot.material not in colMaterials:
+                colMaterials.append(slot.material)
+    for mat in colMaterials:
         for matType in ["color", "specular", "environment"]:
             texID = texSave.get_map(mat, matType)
             if texID == 0 or texID in texIDs:
@@ -56,7 +63,7 @@ def export_stage(tri_name: str, stage_path: str, texSave: TextureSave, stage_bak
     else:
         subfoldermode = 'cache'
     lvl2folder = path.basename(path.dirname(stage_path))
-    # This one should always be "eu"
+    # region folder from the selected stage path
     lvl3folder = path.basename(path.dirname(path.dirname(stage_path)))
     # First, scan manifest.txt for tri reference.
     manifest_path = path.join(stage_path, "manifest.txt")

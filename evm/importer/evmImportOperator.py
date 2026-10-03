@@ -2,7 +2,8 @@ import bpy
 from bpy_extras.io_utils import ImportHelper
 import os
 from ...config import evmConfig
-from ...util.util import replaceExt, texture_modes, changeTextureMode, defaultTexturePaths, triNameFromModel
+from ...tri.texture_sources import TextureChoice, draw_choice, run_import
+from ...util.util import replaceExt, texture_modes, changeTextureMode, defaultTexturePaths, triNameFromModel, triPathFromHashFallback
 
 class ImportMgsEvm(bpy.types.Operator, ImportHelper):
     '''Load an MGS2 EVM File.'''
@@ -16,7 +17,8 @@ class ImportMgsEvm(bpy.types.Operator, ImportHelper):
     texture_mode: bpy.props.EnumProperty(name="Textures", items=texture_modes, default=evmConfig['import.texmode'], update=changeTextureMode)
     texture_path: bpy.props.StringProperty(name="Load Path:", default=defaultTexturePaths[evmConfig['import.texmode']])
     texture_overwrite: bpy.props.BoolProperty(name="Re-extract existing", default=evmConfig['import.ctxr_replace'])
-    merge_material_slots: bpy.props.BoolProperty(name="Merge Similar Material Slots", default=evmConfig['import.merge_mat'])
+    texture_selections: bpy.props.StringProperty(default='{}', options={'HIDDEN', 'SKIP_SAVE'})
+    texture_options: bpy.props.CollectionProperty(type=TextureChoice, options={'HIDDEN', 'SKIP_SAVE'})
 
     files: bpy.props.CollectionProperty(
         name="EVM files",
@@ -30,6 +32,9 @@ class ImportMgsEvm(bpy.types.Operator, ImportHelper):
 
 
     def execute(self, context):
+        return run_import(self, context)
+
+    def import_models(self, context):
         from . import evm_importer
         from ...tri.tri import TRI
         if self.reset_blend:
@@ -55,6 +60,11 @@ class ImportMgsEvm(bpy.types.Operator, ImportHelper):
                 else:
                     tri_path = os.path.join(tri_dir, tri_name)
 
+                if not os.path.exists(tri_path):
+                    hashed_path = triPathFromHashFallback(evm_path, "evm")
+                    if hashed_path is not None:
+                        tri_path = hashed_path
+
                 print("Attempting to load TRI:", tri_path)
                 if os.path.exists(tri_path):
                     tri = TRI()
@@ -63,17 +73,19 @@ class ImportMgsEvm(bpy.types.Operator, ImportHelper):
                     tri.dumpTextures(extract_path)
     
             if self.texture_mode == 'ctxr':
-                # Unless you want to unpack every ctxr in advance, this has to be in the kms loader.
+                # let the evm loader extract only the textures this model uses.
                 if os.path.isabs(self.texture_path):
-                    evm_importer.main(evm_path, self.texture_path, self.texture_overwrite, self.merge_material_slots)
+                    evm_importer.main(evm_path, self.texture_path, self.texture_overwrite)
                 else:
-                    evm_importer.main(evm_path, os.path.join(dirname, self.texture_path), self.texture_overwrite, self.merge_material_slots)
+                    evm_importer.main(evm_path, os.path.join(dirname, self.texture_path), self.texture_overwrite)
             else:
-                evm_importer.main(evm_path, merge_material_slots = self.merge_material_slots)
+                evm_importer.main(evm_path, tri_dir = tri_dir if self.texture_mode == 'tri' else None)
             
         return {'FINISHED'}
         
     def draw(self, context):
+        if draw_choice(self, self.layout):
+            return
         layout = self.layout
         col = layout.column()
         col.prop(self, "reset_blend")
@@ -82,6 +94,4 @@ class ImportMgsEvm(bpy.types.Operator, ImportHelper):
             col.prop(self, "texture_path")
         if self.texture_mode == 'ctxr':
             col.prop(self, "texture_overwrite")
-        col.prop(self, "merge_material_slots")
-        col.label(text="(breaks EVM export)")
 

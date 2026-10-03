@@ -4,7 +4,7 @@ import struct
 
 def readPad(padArray: List[int], file: BufferedReader):
     for pad in range(len(padArray)):
-        padArray[pad] = struct.unpack("<I", file.read(4))
+        padArray[pad] = struct.unpack("<I", file.read(4))[0]
         if padArray[pad] != 0:
             print("Unexpected non-zero pad detected.")
 
@@ -18,6 +18,22 @@ def padOffset(offset: int, pad_amount: int = 0x10):
     if offset % pad_amount == 0:
         return offset
     return offset - (offset % pad_amount) + pad_amount
+
+
+# DG_EVMTYPE_LARGE = model should pass through raw sclae instead of /16.
+# used by:
+#   demo_lope02
+#   sol_snakearm_2_mh_mt
+#   sol_snakearm_2_mh_mt_stage_d080p06
+#   sol_snakearm_mh_mt
+#   sol_snakearm_mh_mt_stage_d070px9
+#   sol_snakearm_mh_mt_stage_d080p01
+#   w24c0_flag_mh
+DG_EVMTYPE_LARGE = 0x00000001
+
+
+def evmPosScale(flag: int) -> float:
+    return 1.0 if (flag & DG_EVMTYPE_LARGE) else 1.0 / 16.0
 
 
 class EVM:
@@ -43,10 +59,7 @@ class EVM:
         
         file.seek(self.header.meshOffset)
         
-        self.meshes = [
-            EVMMesh().fromFile(file)
-            for _ in range(self.header.numMeshes)
-        ]
+        self.meshes = [EVMMesh().fromFile(file, self.header.isPS2) for _ in range(self.header.numMeshes)]
         
         return self
     
@@ -63,20 +76,15 @@ class EVM:
             mesh.numVertex = vertCount
             # Sanity checks
             if len(mesh.normals) != vertCount:
-                print("ERROR: Normal count does not match vertex count")
-                return
+                raise ValueError("Normal count does not match vertex count")
             if mesh.uvs != None and len(mesh.uvs) != vertCount:
-                print("Error: UV 1 count does not match vertex count")
-                return
+                raise ValueError("UV 1 count does not match vertex count")
             if mesh.uvs2 != None and len(mesh.uvs2) != vertCount:
-                print("Error: UV 2 count does not match vertex count")
-                return
+                raise ValueError("UV 2 count does not match vertex count")
             if mesh.uvs3 != None and len(mesh.uvs3) != vertCount:
-                print("Error: UV 3 count does not match vertex count")
-                return
+                raise ValueError("UV 3 count does not match vertex count")
             if mesh.weights != None and len(mesh.weights) != vertCount:
-                print("Error: Weight count does not match vertex count")
-                return
+                raise ValueError("Weight count does not match vertex count")
         
         firstExDataOffset = self.header.meshOffset + 0x70 * self.header.numMeshes
         
@@ -99,7 +107,7 @@ class EVM:
             curExDataOffset = padOffset(curExDataOffset)
 
         for mesh in self.meshes:
-            if mesh.uvs != None and any((x.u, x.v) != (0, 0) for x in mesh.uvs):
+            if mesh.uvs is not None:
                 mesh.uvOffset = curExDataOffset
                 curExDataOffset += 0x8 * mesh.numVertex
             else:
@@ -107,7 +115,7 @@ class EVM:
                 mesh.uvs = None
             curExDataOffset = padOffset(curExDataOffset)
         for mesh in self.meshes:
-            if mesh.uvs2 != None and any((x.u, x.v) != (0, 0) for x in mesh.uvs2):
+            if mesh.uvs2 is not None:
                 mesh.uv2Offset = curExDataOffset
                 curExDataOffset += 0x8 * mesh.numVertex
             else:
@@ -115,7 +123,7 @@ class EVM:
                 mesh.uvs2 = None
             curExDataOffset = padOffset(curExDataOffset)
         for mesh in self.meshes:
-            if mesh.uvs3 != None and any((x.u, x.v) != (0, 0) for x in mesh.uvs3):
+            if mesh.uvs3 is not None:
                 mesh.uv3Offset = curExDataOffset
                 curExDataOffset += 0x8 * mesh.numVertex
             else:
@@ -158,6 +166,24 @@ class EVM:
                     weight.writeToFile(file)
             
             file.seek(returnPos)
+        file.seek(0, 2)
+        file.write(bytes((-file.tell()) % 16))
+
+
+def _detectIsPS2Evm(file: BufferedReader, numBones: int) -> bool:
+    # called at offset 0x20; the PS2 header ends at 0x30, MC at 0x40.
+    returnPos = file.tell()
+    file.seek(returnPos + 0x0C)  # 0x20 + 0x0C = 0x2C
+    ps2MeshOffset = struct.unpack("<I", file.read(4))[0]
+    file.seek(returnPos + 0x10)  # 0x20 + 0x10 = 0x30
+    mcMeshOffset = struct.unpack("<I", file.read(4))[0]
+    file.seek(returnPos)
+    if ps2MeshOffset == 0x30 + numBones * 0x40:
+        return True
+    if mcMeshOffset == 0x40 + numBones * 0x40:
+        return False
+    print("Warning: couldn't detect EVM format (not PS2 or MC), assuming MC")
+    return False
 
 
 class EVMHeader:
@@ -171,6 +197,7 @@ class EVMHeader:
     numMeshes: int
     meshOffset: int
     pad2: List[int] # 3 items
+    isPS2: bool
     
     def __init__(self):
         self.fingerIndex = 0
@@ -182,14 +209,22 @@ class EVMHeader:
         self.flag = 0
         self.numMeshes = 0
         self.pad2 = [0, 0, 0]
+        self.isPS2 = False
     
     def fromFile(self, file: BufferedReader):
         self.fingerIndex, self.numBones = struct.unpack("<II", file.read(8))
         self.minPos.fromFile(file)
         self.maxPos.fromFile(file)
-        self.strcode, self.pad, self.flag, self.numMeshes, \
-        self.meshOffset = struct.unpack("<IIIiI", file.read(0x14))
-        readPad(self.pad2, file)
+        self.isPS2 = _detectIsPS2Evm(file, self.numBones)
+        if self.isPS2:
+            # ps2: size 0x30
+            self.flag, self.strcode, self.numMeshes, self.meshOffset = struct.unpack("<IIiI", file.read(0x10))
+            self.pad = 0
+            self.pad2 = [0, 0, 0]
+        else:
+            # mc: size 0x40
+            self.strcode, self.pad, self.flag, self.numMeshes, self.meshOffset = struct.unpack("<IIIiI", file.read(0x14))
+            readPad(self.pad2, file)
         
         return self
     
@@ -203,7 +238,7 @@ class EVMHeader:
 
 
 class EVMBone:
-    pad: int
+    flag: int
     parentInd: int
     relativePos: EVMVector3
     worldPos: EVMVector3
@@ -213,7 +248,7 @@ class EVMBone:
     parent: EVMBone
     
     def __init__(self):
-        self.pad = 0
+        self.flag = 0
         self.parentInd = -1
         self.relativePos = EVMVector3()
         self.worldPos = EVMVector3()
@@ -222,7 +257,7 @@ class EVMBone:
         self.parent = None
     
     def fromFile(self, file: BufferedReader):
-        self.pad, self.parentInd = struct.unpack("<Ii", file.read(8))
+        self.flag, self.parentInd = struct.unpack("<Ii", file.read(8))
         self.relativePos.fromFile(file)
         self.worldPos.fromFile(file)
         self.minPos.fromFile(file)
@@ -231,7 +266,7 @@ class EVMBone:
         return self
     
     def writeToFile(self, file: BufferedWriter):
-        file.write(struct.pack("<Ii", self.pad, self.parentInd))
+        file.write(struct.pack("<Ii", self.flag, self.parentInd))
         self.relativePos.writeToFile(file)
         self.worldPos.writeToFile(file)
         self.minPos.writeToFile(file)
@@ -371,20 +406,28 @@ class EVMMesh:
         self.uvs3 = None
         self.weights = None
     
-    def fromFile(self, file: BufferedReader):
-        self.flag, self.pad, self.colorMap, self.pad2, \
-        self.specularMap, self.pad3, self.environmentMap, self.pad4, \
-        self.numVertex, self.numSkin = struct.unpack("<10I", file.read(0x28))
-        self.skinningTable = list(struct.unpack("<8B", file.read(8)))
-        self.vertexOffset, self.pad5, self.normalOffset, self.pad6, \
-        self.uvOffset, self.pad7, self.uv2Offset, self.pad8, \
-        self.uv3Offset, self.pad9, self.weightOffset \
-        = struct.unpack("<11I", file.read(0x2C))
-        readPad(self.pad10, file)
+    def fromFile(self, file: BufferedReader, isPS2: bool = False):
+        if isPS2:
+            # size 0x40
+            self.flag, self.colorMap, self.specularMap, self.environmentMap, self.numVertex, self.numSkin = struct.unpack("<6I", file.read(0x18))
+            self.skinningTable = list(struct.unpack("<8B", file.read(8)))
+            self.vertexOffset, self.normalOffset, self.uvOffset, self.uv2Offset, self.uv3Offset, self.weightOffset = struct.unpack("<6I", file.read(0x18))
+            file.read(8)  # trailing pad, pad2
+            self.pad = self.pad2 = self.pad3 = self.pad4 = 0
+            self.pad5 = self.pad6 = self.pad7 = self.pad8 = self.pad9 = 0
+            self.pad10 = [0] * 5
+        else:
+            # MC: size 0x70, pad after every field
+            self.flag, self.pad, self.colorMap, self.pad2, \
+            self.specularMap, self.pad3, self.environmentMap, self.pad4, self.numVertex, self.numSkin = struct.unpack("<10I", file.read(0x28))
+            self.skinningTable = list(struct.unpack("<8B", file.read(8)))
+            self.vertexOffset, self.pad5, self.normalOffset, self.pad6, \
+            self.uvOffset, self.pad7, self.uv2Offset, self.pad8, self.uv3Offset, self.pad9, self.weightOffset = struct.unpack("<11I", file.read(0x2C))
+            readPad(self.pad10, file)
         
         curPos = file.tell()
         
-        #print(self.vertexOffset, self.numVertex)
+        # print(self.vertexOffset, self.numVertex)
         file.seek(self.vertexOffset)
         self.vertices = [
             EVMVertex().fromFile(file)
@@ -457,9 +500,9 @@ class EVMVertex:
     isFace: bool
     
     def __init__(self, x=0, y=0, z=0, isFace=False):
-        self.x = int(x)
-        self.y = int(y)
-        self.z = int(z)
+        self.x = round(x)
+        self.y = round(y)
+        self.z = round(z)
         self.flags = 0x8fff
         self.isFace = isFace
     
@@ -489,9 +532,9 @@ class EVMNormal:
     isFace: bool
     
     def __init__(self, x=0, y=0, z=0):
-        self.x = int(x)
-        self.y = int(y)
-        self.z = int(z)
+        self.x = round(x)
+        self.y = round(y)
+        self.z = round(z)
         self.pad = 0
     
     def fromFile(self, file: BufferedReader):
@@ -506,19 +549,21 @@ class EVMNormal:
 class EVMUv:
     u: int
     v: int
-    unknown: int
+    z: int
+    w: int
     
     def __init__(self, u=0, v=0):
-        self.u = int(u)
-        self.v = int(v)
-        self.unknown = 0x1000
+        self.u = round(u)
+        self.v = round(v)
+        self.z = 0x1000
+        self.w = 0
     
     def fromFile(self, file: BufferedReader):
-        self.u, self.v, self.unknown = struct.unpack("<hhI", file.read(0x8))
+        self.u, self.v, self.z, self.w = struct.unpack("<4h", file.read(0x8))
         return self
     
     def writeToFile(self, file: BufferedWriter):
-        file.write(struct.pack("<hhI", self.u, self.v, self.unknown))
+        file.write(struct.pack("<4h", self.u, self.v, self.z, self.w))
 
 class EVMWeights:
     weights: List[int] # read 4, handle up to numWeights

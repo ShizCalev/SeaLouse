@@ -12,6 +12,13 @@ class KMS:
         self.meshes = []
     
     def fromFile(self, file: BufferedReader):
+        start = file.tell()
+        header = file.read(0x40)
+        if len(header) != 0x40:
+            raise ValueError("KMS header is truncated")
+        if header == bytes(0x40) and file.read(1):
+            raise ValueError("This is a parts library used by a ZMS archive. Open the parent ZMS file instead.")
+        file.seek(start)
         self.header = KMSHeader().fromFile(file)
         
         self.meshes = [
@@ -19,12 +26,47 @@ class KMS:
             for _ in range(self.header.numMesh)
         ]
         
+        self.hasLocalHierarchy = True
+        resolved = set()
+        for i in range(len(self.meshes)):
+            chain = set()
+            while i != -1 and i not in resolved:
+                if i in chain or not 0 <= i < len(self.meshes):
+                    self.hasLocalHierarchy = False
+                    break
+                chain.add(i)
+                i = self.meshes[i].parentInd
+            if not self.hasLocalHierarchy:
+                break
+            resolved.update(chain)
+        # replacement-part libraries can reference bones in a different model.
+        # used by:
+        #   hos_all_def
+        #   hos_all_mid
+        #   hos_all_low
+        #   w04a_us_def
+        #   nyp_def_epa
+        #   cit_male_all_def
         for mesh in self.meshes:
-            mesh.parent = self.meshes[mesh.parentInd] if mesh.parentInd > -1 else None
+            mesh.parent = self.meshes[mesh.parentInd] if self.hasLocalHierarchy and mesh.parentInd > -1 else None
         
         return self
     
     def writeToFile(self, file: BufferedWriter, forceBoneCount: int = -1):
+        # keep imported UV spacing when the stream still fits, including glass_pce's packed UVs.
+        uvStreams = [(p, name, getattr(p, name), p.numVertex) for m in self.meshes for p in m.vertexGroups
+                     for name in ('uvOffset', 'uv2Offset', 'uv3Offset') if getattr(p, name)]
+        uvOffsets = sorted({offset for _, _, offset, _ in uvStreams})
+        nextOffset = dict(zip(uvOffsets, uvOffsets[1:]))
+        uvEnds = {(id(p), name): (offset, count, nextOffset[offset]) for p, name, offset, count in uvStreams
+                  if offset in nextOffset and 0 <= nextOffset[offset] - offset - count * 4 < 16}
+
+        def uvEnd(packet, name, end):
+            previous = uvEnds.get((id(packet), name))
+            if previous and (getattr(packet, name), packet.numVertex) == previous[:2]:
+                return previous[2]
+            return (end + 0xf) & ~0xf
+
         self.header.numMesh = len(self.meshes)
         if forceBoneCount == -1:
             self.header.numBones = len(self.meshes)
@@ -40,17 +82,13 @@ class KMS:
                 vertexGroup.numVertex = vertCount
                 # Sanity checks
                 if len(vertexGroup.normals) != vertCount:
-                    print("ERROR: Normal count does not match vertex count")
-                    return
+                    raise ValueError("Normal count does not match vertex count")
                 if vertexGroup.uvs != None and len(vertexGroup.uvs) != vertCount:
-                    print("Error: UV 1 count does not match vertex count")
-                    return
+                    raise ValueError("UV 1 count does not match vertex count")
                 if vertexGroup.uvs2 != None and len(vertexGroup.uvs2) != vertCount:
-                    print("Error: UV 2 count does not match vertex count")
-                    return
+                    raise ValueError("UV 2 count does not match vertex count")
                 if vertexGroup.uvs3 != None and len(vertexGroup.uvs3) != vertCount:
-                    print("Error: UV 3 count does not match vertex count")
-                    return
+                    raise ValueError("UV 3 count does not match vertex count")
         
         firstMeshOffset = 0x40
         firstVertexGroupOffset = firstMeshOffset + 0x50 * self.header.numMesh
@@ -86,26 +124,23 @@ class KMS:
                 if vertexGroup.uvs != None:
                     vertexGroup.uvOffset = curExDataOffset
                     curExDataOffset += 0x4 * vertexGroup.numVertex
+                    curExDataOffset = uvEnd(vertexGroup, 'uvOffset', curExDataOffset)
                 else:
                     vertexGroup.uvOffset = 0
-                if curExDataOffset % 0x10 > 0:
-                    curExDataOffset = (curExDataOffset + 0xf) & ~0xf
             for vertexGroup in mesh.vertexGroups:
                 if vertexGroup.uvs2 != None:
                     vertexGroup.uv2Offset = curExDataOffset
                     curExDataOffset += 0x4 * vertexGroup.numVertex
+                    curExDataOffset = uvEnd(vertexGroup, 'uv2Offset', curExDataOffset)
                 else:
                     vertexGroup.uv2Offset = 0
-                if curExDataOffset % 0x10 > 0:
-                    curExDataOffset = (curExDataOffset + 0xf) & ~0xf
             for vertexGroup in mesh.vertexGroups:
                 if vertexGroup.uvs3 != None:
                     vertexGroup.uv3Offset = curExDataOffset
                     curExDataOffset += 0x4 * vertexGroup.numVertex
+                    curExDataOffset = uvEnd(vertexGroup, 'uv3Offset', curExDataOffset)
                 else:
                     vertexGroup.uv3Offset = 0
-                if curExDataOffset % 0x10 > 0:
-                    curExDataOffset = (curExDataOffset + 0xf) & ~0xf
                 
         for mesh in self.meshes:
             for vertexGroup in mesh.vertexGroups:
@@ -137,6 +172,8 @@ class KMS:
                 if vertexGroup.uvs3 != None:
                     for uv in vertexGroup.uvs3:
                         uv.writeToFile(file)
+        file.seek(0, 2)
+        file.write(bytes((-file.tell()) % 16))
 
 
 class KMSHeader:
@@ -414,10 +451,10 @@ class KMSVertex:
     weight: int
     
     def __init__(self, x=0, y=0, z=0, weight=4096):
-        self.x = int(x)
-        self.y = int(y)
-        self.z = int(z)
-        self.weight = int(weight)
+        self.x = round(x)
+        self.y = round(y)
+        self.z = round(z)
+        self.weight = round(weight)
     
     def fromFile(self, file: BufferedReader):
         self.x, self.y, self.z, self.weight = struct.unpack("<hhhh", file.read(0x8))
@@ -436,9 +473,9 @@ class KMSNormal:
     isFace: bool
     
     def __init__(self, x=0, y=0, z=0, isFace=False):
-        self.x = int(x)
-        self.y = int(y)
-        self.z = int(z)
+        self.x = round(x)
+        self.y = round(y)
+        self.z = round(z)
         self.flags = 0x8fff
         self.isFace = isFace
     
@@ -462,8 +499,8 @@ class KMSUv:
     v: int
     
     def __init__(self, u=0, v=0):
-        self.u = int(u)
-        self.v = int(v)
+        self.u = round(u)
+        self.v = round(v)
     
     def fromFile(self, file: BufferedReader):
         self.u, self.v = struct.unpack("<hh", file.read(0x4))

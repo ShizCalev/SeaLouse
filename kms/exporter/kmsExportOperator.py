@@ -17,7 +17,6 @@ class ExportMgsKms(bpy.types.Operator, ExportHelper):
     kms_bak: props.EnumProperty(name="Backup KMS", items=BakFileModes, default=kmsConfig['export.kms_bak'])
 
     make_cmdl: props.BoolProperty(name="Generate CMDL supplement", default=kmsConfig['export.make_cmdl'])
-    #big_cmdl: props.BoolProperty(name="Split CMDL faces (DO NOT)", default=False)
     cmdl_path: props.StringProperty(name="CMDL Path", default=kmsConfig['export.cmdl_path'])
     cmdl_bak: props.EnumProperty(name="Backup CMDL", items=BakFileModes, default=kmsConfig['export.cmdl_bak'])
     
@@ -67,7 +66,7 @@ class ExportMgsKms(bpy.types.Operator, ExportHelper):
             
             create_bak(cmdl_path, self.cmdl_bak)
             print("Saving", cmdl_path)
-            cmdl_exporter.main(cmdl_path, collection.name, False, False)
+            cmdl_exporter.main(cmdl_path, collection.name, False, False, native_file=self.filepath)
             print('CMDL COMPLETE :)')
         
         

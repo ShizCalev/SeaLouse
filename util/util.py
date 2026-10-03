@@ -1,5 +1,82 @@
-import os, shutil, struct
+import os, shutil, struct, json
 from ..tri.tri import tri_lookup_path
+
+RAW_NORMAL_ATTR = "sealouse_raw_normal"
+RAW_POSITION_ATTR = "sealouse_raw_position"
+NORMAL_STATE = "sealouse_normal_state_v1"
+
+
+def setRawNormalAttribute(objmesh, normals):
+    attr = objmesh.attributes.new(name=RAW_NORMAL_ATTR, type='FLOAT_VECTOR', domain='POINT')
+    attr.data.foreach_set("vector", [c for n in normals for c in n])
+
+
+def setRawPositionAttribute(objmesh, vertices):
+    attr = objmesh.attributes.new(name=RAW_POSITION_ATTR, type='FLOAT_VECTOR', domain='POINT')
+    attr.data.foreach_set("vector", [c for v in vertices for c in v])
+
+
+def _normalState(mesh):
+    return {
+        "positions": [list(v.co) for v in mesh.vertices],
+        "faces": [[list(p.vertices), p.use_smooth, [list(mesh.loops[i].normal) for i in p.loop_indices]] for p in mesh.polygons],
+        "sharp": [list(e.vertices) for e in mesh.edges if e.use_edge_sharp],
+    }
+
+
+def captureNormalState(mesh):
+    # keep the import state separate from attributes, which blender copies onto new geometry.
+    mesh[NORMAL_STATE] = json.dumps(_normalState(mesh), separators=(",", ":"))
+
+
+def _normalSignatures(state):
+    signatures = [[] for _ in state["positions"]]
+    for vertices, smooth, normals in state["faces"]:
+        face = tuple(vertices)
+        positions = tuple(tuple(state["positions"][i]) for i in vertices)
+        for i, vi in enumerate(vertices):
+            signatures[vi].append((face, positions, smooth, tuple(normals[i])))
+    for a, b in state["sharp"]:
+        edge = (min(a, b), max(a, b))
+        signatures[a].append((edge, (), False, ()))
+        signatures[b].append((edge, (), False, ()))
+    return [sorted(s) for s in signatures]
+
+
+def computeStableVertices(mesh):
+    archived = mesh.get(NORMAL_STATE)
+    if not archived:
+        return frozenset()
+    original = json.loads(archived)
+    current = _normalState(mesh)
+    before, after = _normalSignatures(original), _normalSignatures(current)
+    # preserve a vert's raw normal only if its position, adjacent faces, smoothing and corner normals still match.
+    return frozenset(
+        i
+        for i in range(min(len(before), len(after)))
+        if original["positions"][i] == current["positions"][i] and before[i] == after[i]
+    )
+
+
+def stripCornerKey(mesh, loopIndex, stableVertices):
+    loop = mesh.loops[loopIndex]
+    n = getRawNormal(mesh, loop.vertex_index, loop.normal, stableVertices)
+    return (
+        loop.vertex_index,
+        tuple(round(-c * 4096) for c in n),
+        tuple((round(layer.uv[loopIndex].vector.x * 4096), round((1 - layer.uv[loopIndex].vector.y) * 4096)) for layer in mesh.uv_layers),
+    )
+
+
+def getRawNormal(mesh, vertex_index, live_normal, stableVertices):
+
+    if vertex_index not in stableVertices:
+        return live_normal
+    attr = mesh.attributes.get(RAW_NORMAL_ATTR)
+    if attr is None or vertex_index >= len(attr.data):
+
+        return live_normal
+    return attr.data[vertex_index].vector
 
 kmsBoneNameArray = [
     # Tuples indicate a bone that we would prefer to map differently with MGR models (I like MGR)
@@ -108,15 +185,12 @@ def getBoneIndex(boneName: str, fingerIndex: int = 0):
         return int(boneName[4:])
     raise ValueError(f"Could not recognize bone name {boneName}")
 
-def getFingerIndex(boneNames: list[str]):
-    return sum(1 if x in kmsBoneNames else 0 for x in boneNames)
-
 def getVertWeight(vert, obj = None, group_name: str = None) -> float:
     group_index = 0
     if obj and group_name and group_name in [group.name for group in obj.vertex_groups]:
         group_index = obj.vertex_groups.values().index(obj.vertex_groups[group_name])
     else:
-        print("fuck")
+        raise ValueError(f'Missing KMS bone weight group: {group_name}')
     for group in vert.groups:
         if group.group == group_index:
             return group.weight
@@ -138,8 +212,8 @@ def stripAllExt(path:str) -> str:
     
 texture_modes = [
     ('none', 'No Textures', 'Do not load textures'),
-    ('tri', 'Unpack .tri', 'Unpack .tga from .tri file'),
-    ('ctxr', 'Unpack .ctxr', 'Unpack .png from .ctxr files')
+    ('tri', 'Unpack .tri', 'Unpack .png from .tri file'),
+    ('ctxr', 'Unpack .ctxr', 'Unpack .png from .ctxr files'),
 ]
 
 defaultTexturePaths = [
@@ -156,7 +230,7 @@ def changeTextureMode(self, context):
     if self.texture_mode == 'ctxr':
         self.texture_path = defaultTexturePaths[2]
 
-def triNameFromModel(modelPath: str, modelType: str = None) -> str | None:
+def _readTriCode(modelPath: str, modelType: str = None) -> int | None:
     if modelType is None:
         modelType = os.path.splitext(modelPath)[1][-3:]
     modelType = modelType.lower()
@@ -164,13 +238,66 @@ def triNameFromModel(modelPath: str, modelType: str = None) -> str | None:
         return None
 
     with open(modelPath, "rb") as fp:
-        fp.seek(0x10 if modelType == 'kms' else 0x20)
-        triCode: int = struct.unpack("<I", fp.read(4))[0]
+        if modelType == 'kms':
+            # PS2 stores strcode at 0x0c; MC stores it at 0x10.
+            fp.seek(0x0C)
+            pad, strcode = struct.unpack("<II", fp.read(8))
+            return pad if pad != 0 else strcode
+        else:
+            # MC stores strcode/pad at 0x20/0x24; PS2 stores flag/strcode there, so prefer a nonzero second word.
+            fp.seek(0x20)
+            strcode, pad = struct.unpack("<II", fp.read(8))
+            return pad if pad != 0 else strcode
+
+
+def triNameFromModel(modelPath: str, modelType: str = None) -> str | None:
+    triCode = _readTriCode(modelPath, modelType)
+    if triCode is None:
+        return None
 
     with open(tri_lookup_path, "rt") as fp:
         for line in fp.readlines():
             if int(line.split()[1]) == triCode:
                 return line.split()[2]
 
+
+def gv_strcode(name: str) -> int:
+    value = 0
+    for c in name.encode("latin-1"):
+        value = ((value << 5) | (value >> 19)) & 0xFFFFFF
+        value = (value + ord(chr(c).lower())) & 0xFFFFFF
+    if value == 0:
+        value = 1
+    return value
+
+
+def _looksLikeStrcode(name: str) -> bool:
+    # does he lookuh like a man?
+    return len(name) == 6 and all(c in "0123456789abcdefABCDEF" for c in name)
+
+
+# ps2 stage dumps. if tri are still original strcode, we use the strcode filename, otherwise, use gv_strcode("joydict recovered tri name") to detect the right tri.
+def triPathFromHashFallback(modelPath: str, modelType: str = None) -> str | None:
+    triCode = _readTriCode(modelPath, modelType)
+    if triCode is None:
+        return None
+
+    searchDir = os.path.dirname(modelPath)
+
+    # ps2 .tri without its joydict resolved alias, the actual filename is already the strcode and we can just use that directly.
+    directStrcodePath = os.path.join(searchDir, f"{triCode:06x}.tri")
+    if os.path.exists(directStrcodePath):
+        return directStrcodePath
+
+    for fname in os.listdir(searchDir):
+        if not fname.lower().endswith(".tri"):
+            continue
+        name = os.path.splitext(fname)[0]
+        if _looksLikeStrcode(name):
+            continue  # already checked above (direct strcode match)
+        # ps2 tri that have been renamed back to their original alias by arsenal w/ joydict. rehash the restored alias back to strcode (lol)
+        if gv_strcode(name) == triCode:
+            return os.path.join(searchDir, fname)
     return None
 
+    return None
